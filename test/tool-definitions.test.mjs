@@ -31,16 +31,19 @@ function toolsWithAction(definitions) {
   return definitions.filter(definition => definition.parameters.action !== undefined)
 }
 
-test('four plan tools with stable names and text output', () => {
+test('five plan tools with stable names and text output', () => {
   const definitions = planToolDefinitions(stubDefineTool, service())
-  assert.deepEqual(definitions.map(definition => definition.name), ['plan_read', 'plan_item', 'plan_habit', 'plan_note'])
+  assert.deepEqual(
+    definitions.map(definition => definition.name),
+    ['plan_read', 'plan_item', 'plan_scenario', 'plan_habit', 'plan_note'],
+  )
   for (const definition of definitions) {
     assert.equal(typeof definition.description, 'string')
     assert.equal(definition.output.schema.type, 'string')
     assert.equal(typeof definition.execute, 'function')
     assert.equal(typeof definition.parameters, 'object')
   }
-  assert.equal(toolsWithAction(definitions).length, 3, 'plan_read takes no action')
+  assert.equal(toolsWithAction(definitions).length, 4, 'plan_read takes no action')
 })
 
 test('tool execute bodies drive the real planner ops', async () => {
@@ -52,4 +55,16 @@ test('tool execute bodies drive the real planner ops', async () => {
   const note = await tools.plan_note.execute({ action: 'write', text: 'Идея\nТекст' })
   assert.match(note, /Saved/u)
   assert.equal(await tools.plan_note.execute({ action: 'read' }), 'Идея\nТекст')
+})
+
+test('plan_scenario executes the pause and finish bodies', async () => {
+  const tools = Object.fromEntries(planToolDefinitions(stubDefineTool, service()).map(definition => [definition.name, definition]))
+  const created = await tools.plan_item.execute({ action: 'add', title: 'Задача', day: '2026-11-19' })
+  const id = /it_\w+/u.exec(created)[0]
+  const paused = await tools.plan_scenario.execute({ action: 'pause', id, day: '2026-11-20', time: '10:00' })
+  assert.match(paused, /Paused it_/u)
+  assert.match(paused, /until 2026-11-20 10:00/u)
+  const finished = await tools.plan_scenario.execute({ action: 'finish', id })
+  assert.match(finished, /Closed it_/u)
+  assert.match(finished, /Plan for/u)
 })

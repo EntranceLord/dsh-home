@@ -10,7 +10,7 @@
  * @module @vlln/dsh-home/plan-actions
  */
 
-import { dayKey, validDay } from './planner.mjs'
+import { dayKey, validDay, validTime } from './planner.mjs'
 
 /** The Notes card stores at most 8 KiB of text (same budget as the client). */
 export const NOTES_MAX_BYTES = 8 * 1024
@@ -185,6 +185,118 @@ export function planItem(service, args = {}) {
     return `Deleted ${args.id}: ${current.title}`
   }
   throw new Error('action must be add, update, done or delete')
+}
+
+/**
+ * Find one item by exact title. Two matches need an id: silently picking one
+ * would move or close the wrong thing.
+ * @param items - planner items.
+ * @param title - exact title.
+ * @param options.openOnly - ignore completed items.
+ * @returns the item, or null when nothing matches.
+ */
+function findByTitle(items, title, { openOnly }) {
+  const matches = items.filter(item => item.title === title && (!openOnly || item.done !== true))
+  if (matches.length === 0) return null
+  if (matches.length > 1) throw new Error(`several items are titled ${JSON.stringify(title)}; pass id instead`)
+  return matches[0]
+}
+
+/**
+ * Resolve the pause target: by id, by exact open title, or a fresh task title.
+ * @param service home service
+ * @param args pause arguments
+ * @param day - validated resume day
+ * @returns the item after rescheduling
+ */
+function rescheduleForPause(service, args, day) {
+  const hasId = typeof args.id === 'string' && args.id !== ''
+  const title = typeof args.title === 'string' ? args.title.trim() : ''
+  if (!hasId && title === '') throw new Error('pause needs id or title')
+  if (hasId) {
+    const { doc } = readPlanner(service)
+    findItem(doc, args.id)
+    writePlanner(service, { op: 'item.update', id: args.id, patch: { day } })
+    const { doc: next } = readPlanner(service)
+    return findItem(next, args.id)
+  }
+  const { doc } = readPlanner(service)
+  const existing = findByTitle(doc.items, title, { openOnly: true })
+  if (existing !== null) {
+    writePlanner(service, { op: 'item.update', id: existing.id, patch: { day } })
+    return { ...existing, day }
+  }
+  const next = writePlanner(service, { op: 'item.create', item: { title, day } })
+  return next.items.at(-1)
+}
+
+/**
+ * Add (or refresh) the calendar mark for a paused task. A named time becomes a
+ * "Продолжить: …" event without an end: the time block starts there, and no
+ * duration was asked for.
+ * @param service home service
+ * @param item - the rescheduled task
+ * @param day - resume day
+ * @param time - optional `HH:mm`
+ * @returns the event id, or null when no time was given
+ */
+function markResumeEvent(service, item, day, time) {
+  if (time === undefined || time === null) return null
+  const title = `Продолжить: ${item.title}`
+  const { doc } = readPlanner(service)
+  const existing = doc.items.find(entry => entry.kind === 'event'
+    && entry.done !== true && entry.day === day && entry.title === title)
+  if (existing !== undefined) {
+    writePlanner(service, { op: 'item.update', id: existing.id, patch: { start: time } })
+    return existing.id
+  }
+  const next = writePlanner(service, { op: 'item.create', item: { kind: 'event', title, day, start: time } })
+  return next.items.at(-1).id
+}
+
+/** Pause: reschedule the task and optionally mark the resume time in the calendar. */
+function pauseScenario(service, args) {
+  const day = args.day
+  if (!validDay(day)) throw new Error('day must be YYYY-MM-DD (the date to resume on)')
+  const time = args.time ?? null
+  if (time !== null && !validTime(time)) throw new Error('time must be HH:mm')
+  const item = rescheduleForPause(service, args, day)
+  const eventId = markResumeEvent(service, item, day, time)
+  const when = time === null ? day : `${day} ${time}`
+  return `Paused ${item.id}: ${item.title} until ${when}${eventId === null ? '' : ` (event ${eventId})`}`
+}
+
+/** Finish: close the task, drop its resume mark, and hand back the open plan. */
+function finishScenario(service, args) {
+  const hasId = typeof args.id === 'string' && args.id !== ''
+  const title = typeof args.title === 'string' ? args.title.trim() : ''
+  if (!hasId && title === '') throw new Error('finish needs id or title')
+  const { doc } = readPlanner(service)
+  const item = hasId ? findItem(doc, args.id) : findByTitle(doc.items, title, { openOnly: true })
+  if (item === null) throw new Error(`no open item titled ${JSON.stringify(title)}`)
+  writePlanner(service, { op: 'item.toggle', id: item.id, done: true })
+  // The «Продолжить: …» event exists only as a reminder for a paused task;
+  // finishing the task makes it a stale calendar mark, so remove it.
+  const resumeTitle = `Продолжить: ${item.title}`
+  for (const marker of doc.items) {
+    if (marker.kind === 'event' && marker.done !== true && marker.title === resumeTitle) {
+      writePlanner(service, { op: 'item.delete', id: marker.id })
+    }
+  }
+  return `Closed ${item.id}: ${item.title}\n\n${planRead(service, { all: true })}`
+}
+
+/**
+ * Run one composite planner scenario in a single tool call: the pause
+ * (reschedule + calendar mark) or the finish (close + open-plan summary).
+ * @param service home service
+ * @param args `{ action, id?, title?, day?, time? }`
+ * @returns one-line result, plus the open plan after `finish`
+ */
+export function planScenario(service, args = {}) {
+  if (args.action === 'pause') return pauseScenario(service, args)
+  if (args.action === 'finish') return finishScenario(service, args)
+  throw new Error('action must be pause or finish')
 }
 
 /**

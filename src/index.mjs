@@ -19,7 +19,7 @@
  * @module @vlln/dsh-home
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -28,6 +28,7 @@ import { buildActivity, validateActivityQuery } from './activity.mjs'
 import { appendRead, spentToday } from './balance-history.mjs'
 import { platformKeyRefs } from './balance-key.mjs'
 import { registerPlanTools } from './tool-definitions.mjs'
+import { DEFAULT_FINISH_KEYWORDS, DEFAULT_PAUSE_KEYWORDS, PROTOCOL_SECTION_NAME, PROTOCOL_SECTION_ORDER, PROTOCOL_TEXT, classifyText, messageText, normalizeKeywords, noticeText } from './protocol.mjs'
 import { applyFocusOp, emptyFocus } from './focus.mjs'
 import { buildSnapshot, foldSession, FOLD_VERSION } from './ledger.mjs'
 import { applyPlannerOp, emptyPlanner } from './planner.mjs'
@@ -404,11 +405,78 @@ export function createHomeService(ctx, { log = () => {}, load = loadState, save 
   }
 }
 
+/** Prompt-section and guard settings with fail-soft defaults. */
+export function normalizeProtocol(config = {}) {
+  const source = config !== null && typeof config === 'object' ? config : {}
+  return {
+    enabled: source.protocol !== false,
+    sectionOrder: Number.isFinite(source.protocolOrder) ? source.protocolOrder : PROTOCOL_SECTION_ORDER,
+    pauseKeywords: normalizeKeywords(source.pauseKeywords, DEFAULT_PAUSE_KEYWORDS),
+    finishKeywords: normalizeKeywords(source.finishKeywords, DEFAULT_FINISH_KEYWORDS),
+  }
+}
+
+/**
+ * Watch each root agent's turns and remind the model when the user asked for a
+ * pause or a finish and the planner did not change. The reminder is advisory,
+ * lands at the next admitted step, and never edits the planner itself.
+ *
+ * Session events are observed on the plugin context (root listeners receive
+ * every scoped event); subagent sessions are skipped so delegated work cannot
+ * touch the user's planner.
+ * @param ctx plugin context
+ * @param options service, normalized protocol, logger
+ */
+function installProtocolGuard(ctx, { service, protocol, log }) {
+  // Test harnesses mount the plugin with a minimal context; the guard is an
+  // optional layer, so a context without the event API simply skips it.
+  if (typeof ctx.on !== 'function') return
+  /** @type {Map<string, { agent: object, pending: null | { baseline: number, texts: string[] } }>} */
+  const sessions = new Map()
+  ctx.effect(() => () => sessions.clear())
+  const revision = () => service.getPlanner().planner.revision
+  ctx.on('agent/created', ({ agent }) => {
+    if (agent?.session?.header?.origin === 'subagent') return
+    sessions.set(agent.session.id, { agent, pending: null })
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    sessions.delete(agent?.session?.id)
+  })
+  ctx.on('session/event', (session, event) => {
+    const entry = sessions.get(session?.id)
+    if (entry === undefined) return
+    try {
+      if (event?.type === 'user/message') {
+        if (event.data?.source?.kind !== 'user') return
+        const text = messageText(event.data)
+        if (text === '') return
+        if (entry.pending === null) entry.pending = { baseline: revision(), texts: [] }
+        entry.pending.texts.push(text)
+        return
+      }
+      if (event?.type !== 'turn/end' || entry.pending === null) return
+      const pending = entry.pending
+      entry.pending = null
+      const kind = classifyText(pending.texts.join('\n'), protocol)
+      if (kind === null || revision() !== pending.baseline) return
+      entry.agent.inject({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: noticeText(kind) }],
+        source: { kind: 'dsh-home', form: 'notice', summary: `планер: ${kind}` },
+      })
+    } catch (error) {
+      log(`protocol guard skipped: ${error?.message ?? error}`)
+    }
+  })
+}
+
 /**
  * Cordis entry。
  * @param ctx 宿主上下文
+ * @param config 补丁层配置（可选：protocol、protocolOrder、pauseKeywords、finishKeywords）
  */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
   const log = (message) => {
     try {
       ctx.logger?.('dsh-home')?.debug?.(message)
@@ -417,6 +485,7 @@ export function apply(ctx) {
     }
   }
   const service = createHomeService(ctx, { log })
+  const protocol = normalizeProtocol(config)
 
   // Agent tools: the same service the UI routes use — read the plan, manage
   // items and habits, write the Notes card. `defineTool` is loaded lazily from
@@ -437,6 +506,21 @@ export function apply(ctx) {
       }
     }, 'dsh-home: plan tools')
   })
+
+  // Planner protocol: a static prompt section (always present, cache-stable)
+  // and the turn guard that nudges the model when a pause/finish phrase did
+  // not reach the planner. Without the systemPrompt service the tools still
+  // work; only the protocol layer is skipped.
+  if (protocol.enabled) {
+    ctx.inject(['systemPrompt'], (scoped) => {
+      scoped.effect(() => scoped.systemPrompt.section({
+        name: PROTOCOL_SECTION_NAME,
+        order: protocol.sectionOrder,
+        text: PROTOCOL_TEXT,
+      }))
+    })
+    installProtocolGuard(ctx, { service, protocol, log })
+  }
 
   // 会话持久化是可选的严格注入：服务缺席时首页降级为「暂无数据」，
   // 而不是让整条条目永久 pending（那会让面板、路由一起消失）。

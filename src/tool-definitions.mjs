@@ -6,7 +6,7 @@
  * @module @vlln/dsh-home/tool-definitions
  */
 
-import { planHabit, planItem, planNote, planRead } from './plan-actions.mjs'
+import { planHabit, planItem, planNote, planRead, planScenario } from './plan-actions.mjs'
 
 /** Every tool answers with compact plain text the model can relay as-is. */
 const output = {
@@ -18,7 +18,7 @@ const output = {
  * Build the tool definitions against one home service.
  * @param defineTool the official `defineTool` helper
  * @param service home service (`getPlanner`, `applyPlanner`, `getNote`, `setNote`)
- * @returns four tool definitions, ready for `ctx.tools.register`
+ * @returns five tool definitions, ready for `ctx.tools.register`
  */
 export function planToolDefinitions(defineTool, service) {
   return [
@@ -50,6 +50,19 @@ export function planToolDefinitions(defineTool, service) {
       },
       output,
       execute: async args => planItem(service, args),
+    }),
+    defineTool({
+      name: 'plan_scenario',
+      description: 'Run one composite planner scenario atomically. pause: reschedule a task (or create it from a title) and, when a time is given, add a calendar event "Продолжить: …". finish: close the task (id or exact title) and return the open plan so the next step can be advised.',
+      parameters: {
+        action: { type: 'string', required: true, description: 'pause | finish' },
+        id: { type: 'string', description: 'Item id, when known' },
+        title: { type: 'string', description: 'Exact item title; used when id is unknown (pause creates the task if absent)' },
+        day: { type: 'string', description: 'Local date YYYY-MM-DD; required for pause' },
+        time: { type: 'string', description: 'HH:mm; pause only — creates the resume event at that time' },
+      },
+      output,
+      execute: async args => planScenario(service, args),
     }),
     defineTool({
       name: 'plan_habit',

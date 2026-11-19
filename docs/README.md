@@ -42,3 +42,4 @@
 | [0005](decisions/0005-focus-first.md) | 首页默认形态：三件事加更多，不做报表 |
 | [0006](decisions/0006-boardui-visual-language.md) | 视觉层改用 BoardUI 的语言 |
 | [0007](decisions/0007-today-spend.md) | 今日消费用余额差值算，不用 token 估算 |
+| [0008](decisions/0008-planner-protocol.md) | 计划协议放在插件里：静态提示段 + 复合工具 + 回合守卫，不写 AGENTS.md |
