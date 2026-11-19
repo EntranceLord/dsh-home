@@ -27,6 +27,7 @@ import { isSameOrigin } from './trust.mjs'
 import { buildActivity, validateActivityQuery } from './activity.mjs'
 import { appendRead, spentToday } from './balance-history.mjs'
 import { platformKeyRefs } from './balance-key.mjs'
+import { registerPlanTools } from './tool-definitions.mjs'
 import { applyFocusOp, emptyFocus } from './focus.mjs'
 import { buildSnapshot, foldSession, FOLD_VERSION } from './ledger.mjs'
 import { applyPlannerOp, emptyPlanner } from './planner.mjs'
@@ -38,6 +39,9 @@ export const PLUGIN_ID = 'dsh-home'
 
 /** 前端取数路由（与 client/index.tsx 的 API_PATH 同源）。 */
 export const API_PATH = '/plugins/dsh-home/api'
+
+/** Notes 卡片（v2 是单个文本块，首行即标题）在实例表里的 typeId。 */
+const NOTES_TYPE_ID = '@vlln/dsh-home:notes'
 
 /** Bounded workbench envelope (64 instances, bounded configs and geometry). */
 const BODY_LIMIT = 256 * 1024
@@ -356,6 +360,25 @@ export function createHomeService(ctx, { log = () => {}, load = loadState, save 
       if (doc !== planner) commitPlanner(doc)
       return clone({ planner, storage: plannerStatus })
     },
+    /** 便笺文本：Notes 卡片是单个文本块（v2），首行即标题。 */
+    getNote() {
+      const instance = state.instances.find(entry => entry.typeId === NOTES_TYPE_ID)
+      const text = instance?.config?.text
+      return typeof text === 'string' ? text : ''
+    },
+    setNote(text) {
+      if (typeof text !== 'string') throw widgetStateError('note must be a string', 'bad-note')
+      if (Buffer.byteLength(text, 'utf8') > 8 * 1024) throw widgetStateError('note exceeds 8 KiB', 'bad-note')
+      const instance = state.instances.find(entry => entry.typeId === NOTES_TYPE_ID)
+      if (instance === undefined) throw widgetStateError('add the Notes card to the home canvas first', 'missing-notes')
+      persistState({
+        ...state,
+        instances: state.instances.map(entry => entry.instanceId === instance.instanceId
+          ? { ...entry, configVersion: 2, config: { ...entry.config, text } }
+          : entry),
+      })
+      return text
+    },
     /** 计时文档 + 可写状态。 */
     getFocus() {
       refreshFocus()
@@ -394,6 +417,26 @@ export function apply(ctx) {
     }
   }
   const service = createHomeService(ctx, { log })
+
+  // Agent tools: the same service the UI routes use — read the plan, manage
+  // items and habits, write the Notes card. `defineTool` is loaded lazily from
+  // the official closure; without it the dashboard still runs, just without
+  // agent tools.
+  ctx.inject(['tools'], (scoped) => {
+    scoped.effect(() => {
+      let dispose = () => {}
+      let cancelled = false
+      import('@deepseek-ai/dsh-tools')
+        .then(({ defineTool }) => {
+          if (!cancelled) dispose = registerPlanTools(scoped, service, defineTool)
+        })
+        .catch(error => log(`plan tools unavailable: ${error?.message ?? error}`))
+      return () => {
+        cancelled = true
+        dispose()
+      }
+    }, 'dsh-home: plan tools')
+  })
 
   // 会话持久化是可选的严格注入：服务缺席时首页降级为「暂无数据」，
   // 而不是让整条条目永久 pending（那会让面板、路由一起消失）。
